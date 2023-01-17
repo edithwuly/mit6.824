@@ -27,7 +27,6 @@ import "bytes"
 import "../labgob"
 
 
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -194,10 +193,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 
-	if (args.Term < rf.currentTerm) {
+	if (args.Term <= rf.currentTerm) {
 		reply.VotedGranted = false
 		return
-	} 
+	}
 
 	if ((rf.votedFor == -1 || rf.votedFor == args.CandidateId)) &&
 	 (len(rf.log) == 0 || args.LastLogTerm > rf.log[len(rf.log) - 1].Term || args.LastLogTerm == rf.log[len(rf.log) - 1].Term && args.LastLogIndex >= len(rf.log)) {
@@ -330,7 +329,11 @@ func (rf *Raft) countRequestVoteReply(server int, args *RequestVoteArgs, reply *
 		return
 	}
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if reply.Term > rf.currentTerm {
+
 		rf.currentTerm = reply.Term
 		rf.isleader = false
 		rf.votedFor = -1
@@ -340,10 +343,6 @@ func (rf *Raft) countRequestVoteReply(server int, args *RequestVoteArgs, reply *
 	}
 
 	if reply.VotedGranted {
-
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
 		rf.granted++
 		if !rf.isleader && rf.granted >= len(rf.peers) / 2 + 1 {
 			rf.isleader = true
@@ -364,6 +363,10 @@ func (rf *Raft) countRequestVoteReply(server int, args *RequestVoteArgs, reply *
 
 func (rf *Raft) waitForElection(currentTerm int) {
 	time.Sleep(time.Duration(electionTimeoutMin * 2 / 3) * time.Millisecond)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if (currentTerm != rf.currentTerm) {
 		return
 	}
@@ -413,11 +416,10 @@ func (rf *Raft) countReplicationReply(server int, args *AppendEntriesArgs, reply
 		return
 	}
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if reply.Term > rf.currentTerm {
-
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-
 		rf.currentTerm = reply.Term
 		rf.isleader = false
 		rf.votedFor = -1
@@ -427,8 +429,6 @@ func (rf *Raft) countReplicationReply(server int, args *AppendEntriesArgs, reply
 	}
 
 	if reply.Success {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		successfulIndex := args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = successfulIndex + 1
 		rf.matchIndex[server] = successfulIndex
@@ -446,8 +446,6 @@ func (rf *Raft) countReplicationReply(server int, args *AppendEntriesArgs, reply
 			}
 		}
 	} else {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		rf.nextIndex[server] = reply.NextLogIndex
 	}
 }
@@ -495,17 +493,25 @@ func (rf *Raft) checkLeaderAlive() {
 			rf.doElection()
 		}
 
-		for ; rf.lastApplied < rf.commitIndex && rf.lastApplied < len(rf.log); rf.lastApplied++ {
-			applyMsg := ApplyMsg {
-				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied + 1,
+		rf.mu.Unlock()
+
+		for {
+			rf.mu.Lock()
+			if rf.lastApplied < rf.commitIndex && rf.lastApplied < len(rf.log) {
+				applyMsg := ApplyMsg {
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied + 1,
+				}
+				rf.lastApplied++
+				rf.mu.Unlock()
+				rf.applyCh <- applyMsg
+			} else {
+				rf.mu.Unlock()
+				break
 			}
-			rf.applyCh <- applyMsg
 		}
 		
-		
-		rf.mu.Unlock()
 		time.Sleep(time.Duration(sleepUnit) * time.Millisecond)
 	}
 }

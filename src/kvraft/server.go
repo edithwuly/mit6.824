@@ -7,6 +7,7 @@ import (
 	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -18,11 +19,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	submitTimeOut int = 300
+)
+
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId	int64
+	MsgId		int
+	Key			string
+	Value		string
+	Method		string
 }
 
 type KVServer struct {
@@ -35,15 +45,124 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data	map[string]string
+	replys	map[int64]map[int]ApplyReply
+	waiting	map[int64]map[int]chan ApplyReply
+}
+
+
+func (kv *KVServer) Submit(op Op) ApplyReply {
+	kv.mu.Lock()
+	if lastReply, ok := kv.replys[op.ClientId][op.MsgId]; ok {
+		kv.mu.Unlock()
+		return lastReply
+	}
+
+	_, _, isleader := kv.rf.Start(op)
+	if !isleader {
+		kv.mu.Unlock()
+		return ApplyReply {
+			Err:	ErrWrongLeader,
+		}
+	}
+
+	ch := make(chan ApplyReply)
+	if _, ok := kv.waiting[op.ClientId]; !ok {
+		kv.waiting[op.ClientId] = make(map[int]chan ApplyReply)
+	}
+	kv.waiting[op.ClientId][op.MsgId] = ch
+	kv.mu.Unlock()
+	for {
+		select {
+		case reply := <- ch:
+			kv.mu.Lock()
+			delete(kv.waiting[op.ClientId], op.MsgId)
+			kv.mu.Unlock()
+			return reply
+		case <-time.After(time.Duration(submitTimeOut) * time.Millisecond):
+			kv.mu.Lock()
+			delete(kv.waiting[op.ClientId], op.MsgId)
+			kv.mu.Unlock()
+			return ApplyReply {
+				Err:	ErrTimeOut,
+			}
+		}
+	}
+
+	return ApplyReply{}
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	op := Op {
+		ClientId:	args.ClientId,
+		MsgId:		args.MsgId,
+		Key:		args.Key,
+		Method:		"Get",
+	}
+
+	applyReply := kv.Submit(op)
+	reply.Err = applyReply.Err
+	reply.Value = applyReply.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
+	op := Op {
+		ClientId:	args.ClientId,
+		MsgId:		args.MsgId,
+		Key:		args.Key,
+		Value:		args.Value,
+		Method:		args.Op,
+	}
+
+	applyReply := kv.Submit(op)
+	reply.Err = applyReply.Err
+}
+
+
+func (kv *KVServer) WaitForApplyMsg() {
+	for {
+		select {
+		case applyMsg := <- kv.applyCh:
+			if !applyMsg.CommandValid {
+				continue
+			}
+
+			kv.mu.Lock()
+			op := applyMsg.Command.(Op)
+
+			reply, ok := kv.replys[op.ClientId][op.MsgId]
+			if !ok {
+				if op.Method == "Put" {
+					kv.data[op.Key] = op.Value
+				} else if op.Method == "Append" {
+					kv.data[op.Key] += op.Value
+				}
+	
+				reply = ApplyReply {}
+				if value, ok := kv.data[op.Key]; ok {
+					reply.Err = OK
+					reply.Value = value
+				} else {
+					reply.Err = ErrNoKey
+					reply.Value = ""
+				}
+				if _, ok := kv.replys[op.ClientId]; !ok {
+					kv.replys[op.ClientId] = make(map[int]ApplyReply)
+				}
+				kv.replys[op.ClientId][op.MsgId] = reply
+			}
+			kv.mu.Unlock()
+			
+			if ch, ok := kv.waiting[op.ClientId][op.MsgId]; ok {
+				ch <- reply
+			}
+		}
+	}
 }
 
 //
@@ -96,6 +215,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.data = make(map[string]string)
+	kv.waiting = make(map[int64]map[int]chan ApplyReply)
+	kv.replys = make(map[int64]map[int]ApplyReply)
+
+	go kv.WaitForApplyMsg()
 
 	return kv
 }
